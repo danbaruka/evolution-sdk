@@ -1,4 +1,5 @@
 import { describe, expect, it } from "@effect/vitest"
+import { Schema } from "effect"
 
 import * as CBOR from "../src/CBOR.js"
 
@@ -863,6 +864,31 @@ describe("CBOR Implementation Tests", () => {
           }
         }).not.toThrow()
       })
+    })
+  })
+
+  describe("CborId annotations and FromCborIdBytes", () => {
+    it("getCborId returns annotation when present", () => {
+      const TaggedBytes = CBOR.ByteArray.pipe(
+        Schema.annotations({ [CBOR.CborId]: { tag: 259 } })
+      )
+      const ann = CBOR.getCborId(TaggedBytes)
+      expect(ann).toBeDefined()
+      expect(ann).toHaveProperty("tag", 259)
+    })
+
+    it("FromCborIdBytes round-trips tagged bytes (e.g. address tag 259)", () => {
+      const TaggedBytes = CBOR.ByteArray.pipe(
+        Schema.annotations({ [CBOR.CborId]: { tag: 259 } })
+      )
+      const Codec = CBOR.FromCborIdBytes(TaggedBytes)
+      const bytes = new Uint8Array([1, 2, 3])
+      const encoded = Schema.encodeSync(Codec)(bytes)
+      const decoded = Schema.decodeSync(Codec)(encoded)
+      expect(decoded).toEqual(bytes)
+      expect(encoded[0]).toBe(0xd9) // tag 259 two-byte header
+      expect(encoded[1]).toBe(0x01)
+      expect(encoded[2]).toBe(0x03) // 259 & 0xff
     })
   })
 })

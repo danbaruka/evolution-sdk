@@ -1,4 +1,4 @@
-import { Data, Either as E, ParseResult, Schema } from "effect"
+import { Data, Effect, Either as E, ParseResult, Schema } from "effect"
 
 import * as Bytes from "./Bytes.js"
 
@@ -56,6 +56,136 @@ export const CBOR_SIMPLE = {
   NULL: 22,
   UNDEFINED: 23
 } as const
+
+/**
+ * Symbol for attaching CBOR wire format metadata to an Effect Schema.
+ * Annotate with `schema.annotations({ [CborId]: { ... } })`.
+ *
+ * @since 2.0.0
+ * @category annotations
+ */
+export const CborId = Symbol.for("evolution/CborId") as symbol
+
+/** Wraps the encoded value in a CBOR tag (e.g. `{ tag: 258 }` for sets). */
+export interface CborTagAnnotation {
+  readonly tag: number
+}
+
+/** Struct encoded as a CBOR map with integer keys; optional fields are omitted when undefined. */
+export interface CborStructMapAnnotation {
+  readonly encoding: "map"
+  readonly keys: Readonly<Record<string, bigint>>
+  readonly fields?: Readonly<Record<string, Schema.Schema.Any>>
+}
+
+/** Struct encoded as a positional CBOR array. */
+export interface CborStructArrayAnnotation {
+  readonly encoding: "array"
+  readonly fieldOrder: ReadonlyArray<string>
+  readonly fields?: Readonly<Record<string, Schema.Schema.Any>>
+}
+
+/**
+ * All valid payloads for a `[CborId]` annotation.
+ *
+ * @since 2.0.0
+ * @category annotations
+ */
+export type CborIdAnnotation = CborTagAnnotation | CborStructMapAnnotation | CborStructArrayAnnotation
+
+/**
+ * Reads the `[CborId]` annotation from a schema's AST, if present.
+ *
+ * @since 2.0.0
+ * @category annotations
+ */
+export const getCborId = (schema: Schema.Schema.Any): CborIdAnnotation | undefined =>
+  (schema.ast as { annotations?: Record<symbol, unknown> })?.annotations?.[CborId] as CborIdAnnotation | undefined
+
+// Recursively encode a domain value to CBOR using [CborId] annotations.
+// Falls back to Schema.encodeSync for schemas without an annotation.
+function encodeDomainToCborSync<E>(schema: Schema.Schema<any, any, E>, value: unknown, options: CodecOptions): CBOR {
+  const ann = getCborId(schema)
+  if (ann) {
+    if ("tag" in ann) {
+      const inner = Schema.encodeSync(schema as Schema.Schema<any, any, never>)(value) as CBOR
+      return { _tag: "Tag" as const, tag: ann.tag, value: inner }
+    }
+    if (ann.encoding === "map" && ann.fields) {
+      const rec = value as Record<string, unknown>
+      const map = new Map<CBOR, CBOR>()
+      for (const [field, key] of Object.entries(ann.keys)) {
+        const v = rec[field]
+        if (v === undefined || !ann.fields[field]) continue
+        map.set(key, encodeDomainToCborSync(ann.fields[field], v, options))
+      }
+      return map
+    }
+    if (ann.encoding === "array" && ann.fields) {
+      const rec = value as Record<string, unknown>
+      return ann.fieldOrder
+        .filter((f) => ann.fields![f])
+        .map((f) => encodeDomainToCborSync(ann.fields![f], rec[f], options))
+    }
+  }
+  return Schema.encodeSync(schema as Schema.Schema<any, any, never>)(value) as CBOR
+}
+
+// Recursively decode CBOR to a domain value using [CborId] annotations.
+// Falls back to Schema.decodeSync for schemas without an annotation.
+function decodeCborToDomainSync<E>(schema: Schema.Schema<any, any, E>, cbor: CBOR, options: CodecOptions): unknown {
+  const ann = getCborId(schema)
+  if (ann) {
+    if ("tag" in ann) {
+      if (isTag(cbor as any) && (cbor as any).tag === ann.tag)
+        return Schema.decodeSync(schema as Schema.Schema<any, any, never>)((cbor as any).value)
+      throw new CBORError({ message: `Expected CBOR tag ${ann.tag}` })
+    }
+    if (ann.encoding === "map" && ann.fields) {
+      const cborMap = cbor instanceof Map ? cbor : new Map(Object.entries(cbor as Record<string, CBOR>).map(([k, v]) => [BigInt(k), v]))
+      const result: Record<string, unknown> = {}
+      for (const [field, key] of Object.entries(ann.keys)) {
+        const v = cborMap.get(key)
+        if (v !== undefined && ann.fields[field]) result[field] = decodeCborToDomainSync(ann.fields[field], v, options)
+      }
+      return result
+    }
+    if (ann.encoding === "array" && ann.fields) {
+      const arr = Array.isArray(cbor) ? cbor : []
+      const result: Record<string, unknown> = {}
+      ann.fieldOrder.forEach((field, i) => {
+        if (i < arr.length && ann.fields![field]) result[field] = decodeCborToDomainSync(ann.fields![field], arr[i], options)
+      })
+      return result
+    }
+  }
+  return Schema.decodeSync(schema as Schema.Schema<any, any, never>)(cbor)
+}
+
+/**
+ * Builds a `Uint8Array ↔ A` schema driven by `[CborId]` annotations.
+ * For struct annotations, provide a `fields` record so the engine can recurse.
+ *
+ * @since 2.0.0
+ * @category schemas
+ */
+export const FromCborIdBytes = <A, I, E>(
+  schema: Schema.Schema<A, I, E>,
+  options: CodecOptions = CML_DEFAULT_OPTIONS
+): Schema.Schema<A, Uint8Array, E | ParseResult.ParseError> =>
+  Schema.transformOrFail(Schema.Uint8ArrayFromSelf, Schema.typeSchema(schema), {
+    strict: true,
+    decode: (bytes, _, ast) =>
+      Effect.try({
+        try: () => decodeCborToDomainSync(schema, internalDecodeSync(bytes, options), options) as A,
+        catch: (e) => new ParseResult.Type(ast, bytes, e instanceof CBORError ? e.message : String(e))
+      }),
+    encode: (value, _, ast) =>
+      Effect.try({
+        try: () => internalEncodeSync(encodeDomainToCborSync(schema, value, options), options),
+        catch: (e) => new ParseResult.Type(ast, value, e instanceof CBORError ? e.message : String(e))
+      })
+  })
 
 /**
  * CBOR codec configuration options
